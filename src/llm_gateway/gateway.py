@@ -41,6 +41,9 @@ class LLMGateway:
 
     def generate(self, messages: list[dict], **kwargs):
         return self.router.generate(messages, **kwargs)
+
+    def model_with_structured_output(self, response_model,**kwargs,):
+        return self.router.model_with_structured_output(response_model, **kwargs,)
     
     def get_middleware(self):
         return GatewayMiddleware(self.router)

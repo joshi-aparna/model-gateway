@@ -2,16 +2,21 @@
 from itertools import cycle
 from threading import Lock
 import os
+import time
+import uuid
+
 from langchain_openai import ChatOpenAI
+from langchain_core.runnables import RunnableLambda
+
 from openai import (
     APIConnectionError,
     APIStatusError,
     APITimeoutError,
     RateLimitError,
 )
+
 from llm_gateway.providers import NvidiaProvider, OllamaProvider
-import time
-import uuid
+
 
 class ModelRouter:
 
@@ -20,39 +25,131 @@ class ModelRouter:
         config,
         nvidia_provider: NvidiaProvider,
         ollama_provider: OllamaProvider | None,
-        logger
+        logger,
     ):
         self.config = config
         self.nvidia = nvidia_provider
         self.ollama = ollama_provider
-        self._chat_models = {}
         self.logger = logger
+
+        self._chat_models = {}
 
         self.models = [
             model.id for model in config.nvidia.models
         ]
 
         if not self.models:
-            raise ValueError("At least one NVIDIA model must be configured")
+            raise ValueError(
+                "At least one NVIDIA model must be configured"
+            )
 
         if config.routing.strategy != "round_robin":
             raise ValueError(
-                f"Unsupported routing strategy: {config.routing.strategy}"
+                f"Unsupported routing strategy: "
+                f"{config.routing.strategy}"
             )
 
         self.model_cycle = cycle(self.models)
         self.lock = Lock()
 
+    # --------------------------------------------------
+    # Model selection
+    # --------------------------------------------------
+
     def _next_model(self) -> str:
         with self.lock:
             return next(self.model_cycle)
 
+    def _get_candidates(self):
+        """Get round-robin candidates followed by optional fallback."""
+
+        start_model = self._next_model()
+        start_index = self.models.index(start_model)
+
+        candidates = [
+            (
+                "nvidia",
+                self.models[
+                    (start_index + offset) % len(self.models)
+                ],
+            )
+            for offset in range(len(self.models))
+        ]
+
+        if (
+            self.config.routing.fallback_enabled
+            and self.ollama
+        ):
+            candidates.append(
+                ("ollama", self.ollama.model)
+            )
+
+        return candidates
+
+    # --------------------------------------------------
+    # LangChain model creation
+    # --------------------------------------------------
+
+    def _get_chat_model(self, provider: str, model_id: str):
+
+        key = (provider, model_id)
+
+        if key in self._chat_models:
+            return self._chat_models[key]
+
+        if provider == "nvidia":
+
+            config = self.config.nvidia
+            api_key = os.getenv(config.api_key_env)
+
+            if not api_key:
+                raise ValueError(
+                    f"Environment variable "
+                    f"{config.api_key_env} is not set"
+                )
+
+            model = ChatOpenAI(
+                model=model_id,
+                base_url=config.base_url,
+                api_key=api_key,
+                temperature=0,
+                max_retries=0,
+            )
+
+        elif provider == "ollama":
+
+            model = ChatOpenAI(
+                model=model_id,
+                base_url=self.config.ollama.base_url,
+                api_key="ollama",
+                temperature=0,
+                max_retries=0,
+            )
+
+        else:
+            raise ValueError(
+                f"Unsupported provider: {provider}"
+            )
+
+        self._chat_models[key] = model
+        return model
+
+    # --------------------------------------------------
+    # Retry classification
+    # --------------------------------------------------
+
     def _is_retryable(self, error: Exception) -> bool:
-        status_code = getattr(error, "status_code", None)
+
+        status_code = getattr(
+            error, "status_code", None
+        )
 
         if status_code is not None:
-            return status_code in (401, 408, 409, 429) or status_code >= 500
-        
+            return (
+                status_code in (401, 408, 409, 429)
+                or status_code >= 500
+            )
+
         if isinstance(
             error,
             (
@@ -66,53 +163,40 @@ class ModelRouter:
             return True
 
         if isinstance(error, APIStatusError):
-            return error.status_code in (408, 409, 429) or error.status_code >= 500
+            return (
+                error.status_code in (408, 409, 429)
+                or error.status_code >= 500
+            )
 
         return False
-    
-    def _get_chat_model(self, provider: str, model_id: str):
 
-        key = (provider, model_id)
+    # --------------------------------------------------
+    # Telemetry
+    # --------------------------------------------------
 
-        if key in self._chat_models:
-            return self._chat_models[key]
+    def _log_success(
+        self,
+        provider,
+        model,
+        start,
+        response,
+        attempt,
+        invocation_id,
+    ):
 
-        if provider == "nvidia":
-            config = self.config.nvidia
-            api_key = os.getenv(config.api_key_env)
+        # Middleware may return a wrapper containing the AI message.
+        if hasattr(response, "result"):
+            result = response.result
+            if isinstance(result, (list, tuple)) and result:
+                response = result[0]
 
-            if not api_key:
-                raise ValueError(
-                    f"Environment variable {config.api_key_env} is not set"
-                )
+        usage = getattr(
+            response, "usage_metadata", None
+        ) or {}
 
-            model = ChatOpenAI(
-                model=model_id,
-                base_url=config.base_url,
-                api_key=api_key,
-                temperature=0,
-                max_retries=0,
-            )
-
-        elif provider == "ollama":
-            model = ChatOpenAI(
-                model=model_id,
-                base_url=self.config.ollama.base_url,
-                api_key="ollama",
-                temperature=0,
-                max_retries=0,
-            )
-
-        else:
-            raise ValueError(f"Unsupported provider: {provider}")
-
-        self._chat_models[key] = model
-        return model
-    
-    def _log_success(self, provider, model, start, response, attempt, invocation_id):
-
-        usage = response.usage_metadata or {}
-        metadata = response.response_metadata or {}
+        metadata = getattr(
+            response, "response_metadata", None
+        ) or {}
 
         self.logger.info(
             "LLM request completed",
@@ -128,62 +212,63 @@ class ModelRouter:
                     "total_tokens": usage.get("total_tokens"),
                     "attempt": attempt,
                     "status": "success",
-                    "request_id":  (
+                    "request_id": (
                         metadata.get("request_id")
                         or metadata.get("id")
                     ),
-                    "finish_reason": metadata.get("finish_reason"),
+                    "finish_reason": metadata.get(
+                        "finish_reason"
+                    ),
                     "invocation_id": invocation_id,
                 }
             },
         )
 
-    async def ainvoke(self, request, handler):
-        # Advance round-robin exactly once for this invocation
-        start_model = self._next_model()
-        start_index = self.models.index(start_model)
+    # --------------------------------------------------
+    # Shared asynchronous execution
+    # --------------------------------------------------
 
-        candidates = [
-            ("nvidia", self.models[(start_index + offset) % len(self.models)])
-            for offset in range(len(self.models))
-        ]
+    async def _execute_async(self, invoke):
 
-        if self.config.routing.fallback_enabled and self.ollama:
-            candidates.append(("ollama", self.ollama.model))
+        candidates = self._get_candidates()
 
-        last_error = None
         start = time.perf_counter()
-        attempt = 0
         invocation_id = str(uuid.uuid4())
-        for provider, model_id in candidates:
-            attempt += 1
+        last_error = None
+
+        for attempt, (provider, model_id) in enumerate(
+            candidates, start=1
+        ):
+
             self.logger.info(
                 "Attempting LangChain model",
                 extra={
                     "event_data": {
+                        "invocation_id": invocation_id,
                         "provider": provider,
                         "model": model_id,
+                        "attempt": attempt,
                     }
                 },
             )
 
             try:
-                chat_model = self._get_chat_model(provider, model_id)
 
-                response = await handler(
-                    request.override(model=chat_model)
+                model = self._get_chat_model(
+                    provider, model_id
                 )
-                ai_message = response.result[0]
 
+                response = await invoke(model)
 
                 self._log_success(
                     provider=provider,
                     model=model_id,
                     start=start,
-                    response=ai_message,
+                    response=response,
                     attempt=attempt,
-                    invocation_id=invocation_id
+                    invocation_id=invocation_id,
                 )
+
                 return response
 
             except Exception as error:
@@ -200,96 +285,203 @@ class ModelRouter:
                             "invocation_id": invocation_id,
                             "provider": provider,
                             "model": model_id,
+                            "attempt": attempt,
                             "latency_ms": round(
-                                                    (time.perf_counter() - start) * 1000
-                                                ),
+                                (time.perf_counter() - start) * 1000
+                            ),
                             "error": str(error),
                         }
                     },
                 )
 
-        self.logger.error("All configured models failed", 
-                          extra={"event_data": {
-                              "invocation_id": invocation_id,
-                              "latency_ms": round((time.perf_counter() - start) * 1000),
-                              "error": str(last_error) if last_error else "No error captured"}
-                              })
+        self.logger.error(
+            "All configured models failed",
+            extra={
+                "event_data": {
+                    "invocation_id": invocation_id,
+                    "latency_ms": round(
+                        (time.perf_counter() - start) * 1000
+                    ),
+                    "error": str(last_error),
+                }
+            },
+        )
 
         if last_error:
             raise last_error
 
-        raise RuntimeError("No available models")    
+        raise RuntimeError("No available models")
 
-    def generate(self, messages: list[dict], **kwargs):
+    # --------------------------------------------------
+    # Shared synchronous execution
+    # --------------------------------------------------
 
-        # Select starting model using round-robin
-        start_model = self._next_model()
-        start_index = self.models.index(start_model)
+    def _execute_sync(self, invoke):
 
-        # Attempt every NVIDIA model exactly once
-        for offset in range(len(self.models)):
-            model = self.models[
-                (start_index + offset) % len(self.models)
-            ]
+        candidates = self._get_candidates()
+
+        start = time.perf_counter()
+        invocation_id = str(uuid.uuid4())
+        last_error = None
+
+        for attempt, (provider, model_id) in enumerate(
+            candidates, start=1
+        ):
 
             self.logger.info(
-                "Attempting NVIDIA model",
+                "Attempting model",
                 extra={
                     "event_data": {
-                        "provider": "nvidia",
-                        "model": model
+                        "invocation_id": invocation_id,
+                        "provider": provider,
+                        "model": model_id,
+                        "attempt": attempt,
                     }
-                }
+                },
             )
 
             try:
-                return self.nvidia.generate(
-                    model=model,
-                    messages=messages,
-                    **kwargs
+
+                response = invoke(provider, model_id)
+
+                self._log_success(
+                    provider=provider,
+                    model=model_id,
+                    start=start,
+                    response=response,
+                    attempt=attempt,
+                    invocation_id=invocation_id,
                 )
 
-            except Exception:
-                self.logger.exception(
-                    "NVIDIA model failed",
+                return response
+
+            except Exception as error:
+
+                if not self._is_retryable(error):
+                    raise
+
+                last_error = error
+
+                self.logger.warning(
+                    "Model failed; trying next candidate",
                     extra={
                         "event_data": {
-                            "provider": "nvidia",
-                            "model": model
+                            "invocation_id": invocation_id,
+                            "provider": provider,
+                            "model": model_id,
+                            "attempt": attempt,
+                            "error": str(error),
                         }
-                    }
+                    },
                 )
 
-        # All NVIDIA models failed
-        if not self.config.routing.fallback_enabled or self.ollama is None:
-            raise RuntimeError(
-                "All configured NVIDIA models failed and fallback is disabled"
-            )
-
-        self.logger.warning(
-            "All NVIDIA models failed. Falling back to Ollama.",
+        self.logger.error(
+            "All configured models failed",
             extra={
                 "event_data": {
-                    "provider": "ollama",
-                    "model": self.ollama.model
+                    "invocation_id": invocation_id,
+                    "error": str(last_error),
                 }
-            }
+            },
         )
 
-        try:
-            return self.ollama.generate(
-                messages=messages,
-                **kwargs
+        if last_error:
+            raise last_error
+
+        raise RuntimeError("No available models")
+
+    # --------------------------------------------------
+    # Public API 1: Async LangChain invocation
+    # --------------------------------------------------
+
+    async def ainvoke(self, request, handler):
+
+        async def invoke(model):
+            return await handler(
+                request.override(model=model)
             )
 
-        except Exception:
-            self.logger.exception(
-                "Ollama fallback failed",
-                extra={
-                    "event_data": {
-                        "provider": "ollama",
-                        "model": self.ollama.model
-                    }
-                }
+        return await self._execute_async(invoke)
+
+    # --------------------------------------------------
+    # Public API 2: Structured output
+    # --------------------------------------------------
+
+    def model_with_structured_output(
+        self,
+        response_model,
+        **kwargs,
+    ):
+        """
+        Return a LangChain Runnable.
+
+        Every invocation selects a model independently,
+        including retries and fallback.
+        """
+
+        def invoke_sync(prompt):
+
+            def execute(provider, model_id):
+
+                model = self._get_chat_model(
+                    provider, model_id
+                )
+
+                structured_model = (
+                    model.with_structured_output(
+                        response_model,
+                        **kwargs,
+                    )
+                )
+
+                return structured_model.invoke(prompt)
+
+            return self._execute_sync(execute)
+
+        async def invoke_async(prompt):
+
+            async def execute(model):
+
+                structured_model = (
+                    model.with_structured_output(
+                        response_model,
+                        **kwargs,
+                    )
+                )
+
+                return await structured_model.ainvoke(
+                    prompt
+                )
+
+            return await self._execute_async(execute)
+
+        return RunnableLambda(
+            func=invoke_sync,
+            afunc=invoke_async,
+        )
+
+    # --------------------------------------------------
+    # Public API 3: Synchronous provider generation
+    # --------------------------------------------------
+
+    def generate(
+        self,
+        messages: list[dict],
+        **kwargs,
+    ):
+
+        def invoke(provider, model_id):
+
+            if provider == "nvidia":
+                return self.nvidia.generate(
+                    model=model_id,
+                    messages=messages,
+                    **kwargs,
+                )
+
+            return self.ollama.generate(
+                messages=messages,
+                **kwargs,
             )
-            raise
+
+        return self._execute_sync(invoke)

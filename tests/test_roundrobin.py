@@ -1,5 +1,5 @@
 import os
-
+from dotenv import load_dotenv
 from llm_gateway import LLMGateway
 from pathlib import Path
 
@@ -7,6 +7,7 @@ config_path = Path(__file__).parent / "testconfig_roundrobin.yaml"
 
 
 def main():
+    load_dotenv()
     if not os.getenv("NVIDIA_API_KEY"):
         raise ValueError("NVIDIA_API_KEY is not configured")
 
