@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "llm-gateway"
+version = "0.1.0"
+description = "Reusable LLM gateway with cloud and local inference"
+requires-python = ">=3.11"
+dependencies = [
+    "openai>=1.50",
+    "pydantic>=2.0",
+    "pyyaml>=6.0",
+    "requests>=2.32",
+    "langchain>=1.0.0,<2.0",
+    "langchain-core>=1.7.0,<2.0",
+    "langchain-openai"
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "langchain-ollama",
+    "python-dotenv"
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
