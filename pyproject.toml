@@ -21,7 +21,8 @@ dependencies = [
 dev = [
     "pytest>=8.0",
     "langchain-ollama",
-    "python-dotenv"
+    "python-dotenv",
+    "shopping-agent-models @ git+https://github.com/joshi-aparna/shopping-list-agent.git@shopping-agent-models-v0.1.0#subdirectory=shopping_agent_models"
 ]
 
 [tool.setuptools.packages.find]

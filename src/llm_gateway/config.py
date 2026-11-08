@@ -7,7 +7,7 @@ from pydantic import BaseModel, Field
 
 class ModelConfig(BaseModel):
     id: str
-    alias: str = "default"
+    aliases: list[str] = Field(default_factory=list)
 
 
 class NvidiaConfig(BaseModel):

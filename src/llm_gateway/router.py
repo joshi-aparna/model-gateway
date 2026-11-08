@@ -59,8 +59,34 @@ class ModelRouter:
     def _next_model(self) -> str:
         with self.lock:
             return next(self.model_cycle)
+        
+    def _get_model_aliases(self, model_id):
+        model = next(
+            m for m in self.config.nvidia.models
+            if m.id == model_id
+        )
+        return model.aliases or []
+        
+    def _filter_models(self, aliases=None):
+        if aliases is None:
+            return self.models
 
-    def _get_candidates(self):
+        if not aliases:
+            raise ValueError("Aliases cannot be empty")
+
+        if isinstance(aliases[0], str):
+            aliases = [aliases]
+
+        return [
+            model_id
+            for model_id in self.models
+            if all(
+                set(group) & set(self._get_model_aliases(model_id))
+                for group in aliases
+            )
+        ]
+    
+    def _get_candidates(self, aliases=None):
         """Get round-robin candidates followed by optional fallback."""
 
         start_model = self._next_model()
@@ -75,6 +101,22 @@ class ModelRouter:
             )
             for offset in range(len(self.models))
         ]
+        if aliases is not None:
+            eligible_models = set(self._filter_models(aliases))
+            candidates = [
+                candidate
+                for candidate in candidates
+                if candidate[1] in eligible_models
+            ]
+            self.logger.info(
+                "Filtered candidates based on aliases",
+                extra={
+                    "event_data": {
+                        "aliases": aliases,
+                        "eligible_models": list(eligible_models),
+                        "candidates": candidates,
+                    }
+                },)
 
         if (
             self.config.routing.fallback_enabled
@@ -228,9 +270,9 @@ class ModelRouter:
     # Shared asynchronous execution
     # --------------------------------------------------
 
-    async def _execute_async(self, invoke):
+    async def _execute_async(self, invoke,  aliases=None):
 
-        candidates = self._get_candidates()
+        candidates = self._get_candidates(aliases)
 
         start = time.perf_counter()
         invocation_id = str(uuid.uuid4())
@@ -245,6 +287,7 @@ class ModelRouter:
                 extra={
                     "event_data": {
                         "invocation_id": invocation_id,
+                        "aliases": aliases,
                         "provider": provider,
                         "model": model_id,
                         "attempt": attempt,
@@ -316,9 +359,9 @@ class ModelRouter:
     # Shared synchronous execution
     # --------------------------------------------------
 
-    def _execute_sync(self, invoke):
+    def _execute_sync(self, invoke, aliases=None):
 
-        candidates = self._get_candidates()
+        candidates = self._get_candidates(aliases)
 
         start = time.perf_counter()
         invocation_id = str(uuid.uuid4())
@@ -329,10 +372,11 @@ class ModelRouter:
         ):
 
             self.logger.info(
-                "Attempting model",
+                "Attempting model" + model_id,
                 extra={
                     "event_data": {
                         "invocation_id": invocation_id,
+                        "aliases": aliases,
                         "provider": provider,
                         "model": model_id,
                         "attempt": attempt,
@@ -394,14 +438,16 @@ class ModelRouter:
     # Public API 1: Async LangChain invocation
     # --------------------------------------------------
 
-    async def ainvoke(self, request, handler):
-
+    async def ainvoke(self, request, handler, aliases=None):
+        self.logger.info(
+            "Beginning aiinvoke",
+        )
         async def invoke(model):
             return await handler(
                 request.override(model=model)
             )
 
-        return await self._execute_async(invoke)
+        return await self._execute_async(invoke, aliases=aliases)
 
     # --------------------------------------------------
     # Public API 2: Structured output
@@ -410,6 +456,7 @@ class ModelRouter:
     def model_with_structured_output(
         self,
         response_model,
+        aliases=None,
         **kwargs,
     ):
         """
@@ -418,7 +465,9 @@ class ModelRouter:
         Every invocation selects a model independently,
         including retries and fallback.
         """
-
+        self.logger.info(
+            "Beginning model_with_structured_output",
+        )
         def invoke_sync(prompt):
 
             def execute(provider, model_id):
@@ -436,7 +485,7 @@ class ModelRouter:
 
                 return structured_model.invoke(prompt)
 
-            return self._execute_sync(execute)
+            return self._execute_sync(execute, aliases=aliases)
 
         async def invoke_async(prompt):
 
@@ -453,7 +502,7 @@ class ModelRouter:
                     prompt
                 )
 
-            return await self._execute_async(execute)
+            return await self._execute_async(execute, aliases=aliases)
 
         return RunnableLambda(
             func=invoke_sync,
@@ -467,9 +516,12 @@ class ModelRouter:
     def generate(
         self,
         messages: list[dict],
+        aliases=None,
         **kwargs,
     ):
-
+        self.logger.info(
+            "Beginning generate",
+        )
         def invoke(provider, model_id):
 
             if provider == "nvidia":
@@ -484,4 +536,4 @@ class ModelRouter:
                 **kwargs,
             )
 
-        return self._execute_sync(invoke)
+        return self._execute_sync(invoke, aliases=aliases)

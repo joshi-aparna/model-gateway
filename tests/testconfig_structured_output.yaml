@@ -1,0 +1,35 @@
+nvidia:
+  base_url: https://integrate.api.nvidia.com/v1
+  api_key_env: NVIDIA_API_KEY
+  models:
+    - id: nvidia/nemotron-3.5-bolt-e4b
+      alias: structure
+    - id: nvidia/nemotron-3.5-super-vl-120b-a12b
+      alias: structure
+    - id: minimaxai/minimax-m3.1-flash
+      alias: structure
+    - id: nvidia/nemotron-3.5-lightning-30b-a3b
+      alias: structure
+    - id: openai/gpt-oss-20b
+      alias: structure
+    - id: mistralai/mistral-large-4-1t-a52b
+      alias: structure
+    - id: z-ai/glm-5.3-flash
+      alias: structure
+    - id: stepfun-ai/step-5-preview
+      alias: structure
+
+ollama:
+  base_url: http://localhost:11434/v1
+  model: qwen3:30b
+  enabled: true
+
+routing:
+  strategy: round_robin
+  fallback_enabled: true
+
+logging:
+  level: INFO
+  file: Logs/llm-gateway.log
+  max_bytes: 10485760
+  backup_count: 5
