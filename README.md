@@ -1,13 +1,19 @@
 # LLM Gateway
 
-A reusable Python library that routes LLM requests across NVIDIA-hosted models, with local Ollama fallback.
+A reusable Python library for routing LLM requests across multiple providers, with automatic retries and fallback to local Ollama models.
 
-The gateway provides two ways to use it:
+LLM Gateway provides a single integration point for applications that need to work with multiple LLM providers without managing provider selection and failover themselves.
 
-- **Direct API:** Send OpenAI-compatible chat requests through `generate()`.
-- **LangChain agents:** Add gateway middleware to an agent. The gateway selects models, retries retryable failures, and falls back to Ollama without restarting the agent.
+**Key features**
 
-Each application supplies its own model configuration.
+- **Multi-model routing:** Distribute requests across configured NVIDIA-hosted models using round-robin selection.
+- **Automatic retries:** Try alternative configured models when a provider returns a retryable failure.
+- **Local fallback:** Fall back to Ollama when configured NVIDIA models are unavailable.
+- **LangChain integration:** Use gateway middleware with LangChain agents. Model selection and failover happen transparently during agent execution.
+- **Structured output:** Route structured-output requests through the gateway using LangChain's `with_structured_output()` interface.
+- **Centralized logging:** Record provider, model, latency, token usage, attempt status, and invocation correlation ID.
+
+Each consuming application maintains its own model configuration, allowing different applications to use different models and routing strategies.
 
 ## Installation
 
@@ -15,15 +21,9 @@ Each application supplies its own model configuration.
 pip install git+https://github.com/joshi-aparna/model-gateway.git
 ```
 
-For LangChain integration, install the optional integration dependencies:
-
-```bash
-pip install "langchain>=1.0,<2.0" langchain-core langchain-openai
-```
-
 ## Configuration
 
-Create a YAML file for your application:
+Create a YAML configuration file for your application.
 
 ```yaml
 nvidia:
@@ -49,15 +49,19 @@ logging:
   backup_count: 5
 ```
 
-Set the NVIDIA API key in the environment:
+Set your NVIDIA API key as an environment variable:
 
 ```bash
 export NVIDIA_API_KEY=your_api_key
 ```
 
+The gateway reads the configuration when initialized. Applications can maintain separate configuration files without changing their integration code.
+
 ## Usage
 
-### Direct API
+### 1. Direct API
+
+Use `generate()` to send chat completion requests through the gateway.
 
 ```python
 from llm_gateway import LLMGateway
@@ -65,16 +69,21 @@ from llm_gateway import LLMGateway
 with LLMGateway.from_config("config/llm.yaml") as gateway:
     response = gateway.generate(
         messages=[
-            {"role": "user", "content": "Explain Kubernetes briefly."}
+            {
+                "role": "user",
+                "content": "Explain Kubernetes briefly."
+            }
         ]
     )
 
     print(response.choices[0].message.content)
 ```
 
-### LangChain agent
+The gateway handles model selection, retries, and provider fallback internally.
 
-Attach the gateway middleware when creating your agent:
+### 2. LangChain agents
+
+Integrate the gateway with LangChain agents using middleware.
 
 ```python
 from langchain.agents import create_agent
@@ -94,30 +103,77 @@ async def main():
 
         result = await agent.ainvoke({
             "messages": [
-                {"role": "user", "content": "Explain Kubernetes briefly."}
+                {
+                    "role": "user",
+                    "content": "Explain Kubernetes briefly."
+                }
             ]
         })
 
         print(result["messages"][-1].content)
 ```
 
-The model passed to `create_agent` is the initial model. The gateway middleware selects the actual model for each invocation.
-
-For this example, install the placeholder model integration separately:
+Install the example's initial model integration separately:
 
 ```bash
 pip install langchain-ollama
 ```
 
+The model passed to `create_agent()` acts as the initial model. The gateway middleware selects the actual model for each invocation, enabling provider switching and fallback without recreating the agent.
+
+### 3. Structured output
+
+The gateway also supports structured-output requests through its model interface.
+
+```python
+structured_model = gateway.model_with_structured_output(
+    response_model,
+    method="json_schema"
+)
+```
+
+This allows applications to use Pydantic response models while retaining gateway-managed model selection and routing.
+
+The actual structured-output behavior depends on the selected provider and model's support for the requested output method.
+
 ## Routing
 
-For each model invocation, the gateway:
+For each model invocation, the gateway follows this process:
 
-1. Selects a starting NVIDIA model using round-robin.
-2. Tries other configured NVIDIA models after retryable failures.
-3. Falls back to Ollama if all NVIDIA models fail and fallback is enabled.
-4. Propagates the error if no configured model succeeds.
+1. Select a starting NVIDIA model using the configured routing strategy.
+2. Attempt the request using the selected model.
+3. Retry with other configured NVIDIA models when a retryable failure occurs.
+4. Fall back to Ollama if all NVIDIA models fail and fallback is enabled.
+5. Propagate the error if no configured provider succeeds.
 
-The gateway also logs model, provider, latency, token usage when available, attempt status, and invocation correlation ID.
+This keeps provider-specific failure handling out of consuming applications.
 
-Use the gateway as a context manager so its provider resources are released when the application finishes.
+## Logging
+
+The gateway provides centralized logging for model invocations, including:
+
+- Provider and model
+- Request latency
+- Token usage, when available
+- Attempt number and status
+- Invocation correlation ID
+
+Logging can be configured per application, including log level, file location, and rotation settings.
+
+## Resource Management
+
+Use `LLMGateway` as a context manager to ensure provider resources are released when the application finishes.
+
+```python
+with LLMGateway.from_config("config/llm.yaml") as gateway:
+    # Make LLM requests
+    ...
+```
+
+## Design Philosophy
+
+LLM Gateway separates model routing from application logic.
+
+Applications decide what they need from an LLM. The gateway decides which configured model should handle the request and manages retries and provider fallback.
+
+This makes it easier to experiment with models, accommodate provider failures, and introduce new providers without rewriting application integrations.
