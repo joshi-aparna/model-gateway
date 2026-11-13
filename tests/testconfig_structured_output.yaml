@@ -2,12 +2,6 @@ nvidia:
   base_url: https://integrate.api.nvidia.com/v1
   api_key_env: NVIDIA_API_KEY
   models:
-    - id: nvidia/nemotron-3.5-bolt-e4b
-      alias: structure
-    - id: nvidia/nemotron-3.5-super-vl-120b-a12b
-      alias: structure
-    - id: minimaxai/minimax-m3.1-flash
-      alias: structure
     - id: nvidia/nemotron-3.5-lightning-30b-a3b
       alias: structure
     - id: openai/gpt-oss-20b
@@ -22,7 +16,7 @@ nvidia:
 ollama:
   base_url: http://localhost:11434/v1
   model: qwen3:30b
-  enabled: true
+  enabled: false
 
 routing:
   strategy: round_robin
